@@ -7186,3 +7186,15 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+def leg_sync_reward(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+)-> torch.Tensor:
+    left_hip = env.scene[asset_cfg.name].data.qpos  
+    print("env.scene[asset_cfg.name].data.qpos", env.scene[asset_cfg.name].data.qpos)
+    right_hip = env.scene[asset_cfg.name].data.qpos
+    
+    phase_diff = torch.abs(left_hip - right_hip)
+    reward = - torch.square(phase_diff) 
+    return reward 

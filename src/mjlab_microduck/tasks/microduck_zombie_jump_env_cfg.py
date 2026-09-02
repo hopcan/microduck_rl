@@ -277,11 +277,6 @@ def make_microduck_velocity_zombie_jump_env_cfg(
     cfg.rewards["pose"].params["std_standing"] = std_standing  # tight when command=0
     cfg.rewards["pose"].params["std_walking"] = std_walking
     cfg.rewards["pose"].params["std_running"] = std_walking
-    # Pose reward operates on LEG joints only. Head/neck are command-driven
-    # (head_pose_tracking) — if they were in this reward too, it would pull
-    # them to HOME while head_pose_tracking pulls them to the command, and the
-    # policy converges to "ignore the command" because pose reward dominates
-    # once head_pose_tracking's gradient dies at large commands.
     cfg.rewards["pose"].params["asset_cfg"] = SceneEntityCfg(
         "robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",)
     )
@@ -290,40 +285,27 @@ def make_microduck_velocity_zombie_jump_env_cfg(
 
     # Body-specific reward configurations
     cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
-    # upright: deliberately strong (2.0 / std²=0.05, was 1.0 / std²=0.1).
-    # 2026-07 pitch-vs-speed eval: the policy walks with a +2-4° steady forward
-    # lean (p90 ~6-8°) and ~2/3 of push-induced falls at speed are FORWARD. At
-    # weight 1.0 / std²=0.1 a 4° lean cost ~0.05/step — effectively free. At
-    # 2.0 / std²=0.05 it costs ~0.19/step: enough gradient to hold the trunk
-    # level in steady gait while transient lean (push recovery, accel) stays
-    # affordable.
     cfg.rewards["upright"].weight = 2.0
     cfg.rewards["upright"].params["std"] = math.sqrt(0.05)
-
-    # Foot-specific configurations. In mjlab 1.3.0 foot_swing_height is fully
-    # sensor-driven (no asset_cfg); only foot_clearance/foot_slip still carry an
-    # asset_cfg whose site_names select the feet.
     for reward_name in ["foot_clearance", "foot_slip"]:
         cfg.rewards[reward_name].params["asset_cfg"].site_names = site_names
 
     # Body-specific configurations
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
-
-    # foot_slip deliberately weak (-0.1, not -1.0): -1.0 was too restrictive
-    # for this robot's pivot-heavy turning.
     cfg.rewards["foot_slip"].weight = -0.1
     cfg.rewards["foot_slip"].params["command_threshold"] = 0.01
 
     cfg.rewards.pop("soft_landing", None)
-
-    # Self-collision penalty: discourages legs from crashing into the trunk
-    # battery holder (the self_collision_only-classed geoms on leg, leg_2,
-    # battery_holder). With proper joint-range limits the policy can't actually
-    # reach the body, but a positive signal here keeps it well clear.
     cfg.rewards["self_collisions"] = RewardTermCfg(
         func=mdp.self_collision_cost,
         weight=-1.0,
         params={"sensor_name": self_collision_cfg.name},
+    )
+
+    cfg.rewards["leg_sync"] = RewardTermCfg(
+        func=microduck_mdp.leg_sync_reward,
+        weight=1.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
 
@@ -332,8 +314,8 @@ def make_microduck_velocity_zombie_jump_env_cfg(
     # not by an explicit stillness/no-stepping term.
     cfg.rewards["air_time"].weight = 3.0
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
-    cfg.rewards["air_time"].params["threshold_min"] = 0.200
-    cfg.rewards["air_time"].params["threshold_max"] = 0.500
+    cfg.rewards["air_time"].params["threshold_min"] = 0.100
+    cfg.rewards["air_time"].params["threshold_max"] = 0.300
 
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
