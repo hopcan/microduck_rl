@@ -75,6 +75,10 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_zombie_jump_env_cfg import (
+    make_microduck_velocity_zombie_jump_env_cfg,
+    MicroduckZombieJumpRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Standard velocity task
@@ -232,6 +236,13 @@ register_mjlab_task(
     rl_cfg=MicroduckRouladeRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+register_mjlab_task(
+    task_id="Mjlab-Velocity-zombie-jump-Backlash-MicroDuck",
+    env_cfg=make_microduck_velocity_zombie_jump_env_cfg(),
+    play_env_cfg=make_microduck_velocity_zombie_jump_env_cfg(play=True),
+    rl_cfg=MicroduckZombieJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 # Backlash variants — ±1° serial gear play per servo + encoder-through-backlash
 # actuator feedback and joint obs (see tasks/backlash.py). Each family keeps its
@@ -267,6 +278,7 @@ _BACKLASH_TASKS = (
     ("Mjlab-Velocity-Swizzle-Backlash-MicroDuck", make_microduck_velocity_swizzle_env_cfg, {}, MicroduckSwizzleRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerCrouch-Flat-Backlash-MicroDuck", make_microduck_roller_crouch_env_cfg, {}, MicroduckRollerCrouchRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerSlope-Flat-Backlash-MicroDuck", make_microduck_roller_slope_env_cfg, {}, MicroduckRollerSlopeRlCfg, _BL_ROLLERS),
+    ("Mjlab-Velocity-zombie-jump-Backlash-MicroDuck", make_microduck_velocity_zombie_jump_env_cfg, {}, MicroduckZombieJumpRlCfg, _BL_WALK),
 )
 for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:
     register_mjlab_task(
