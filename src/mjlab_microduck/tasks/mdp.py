@@ -7201,8 +7201,172 @@ def leg_sync_reward(
     left_knee = env.scene[asset_cfg.name].data.joint_pos[:,4]
     right_knee = env.scene[asset_cfg.name].data.joint_pos[:,13]
 
-    front_diff = torch.abs(left_pitch - right_pitch)
-    rear_diff = torch.abs(left_knee - right_knee)
+    front_diff = torch.abs(left_pitch + right_pitch)
+    rear_diff = torch.abs(left_knee + right_knee)
     avg_diff = (front_diff + rear_diff) / 2.0
     reward = - torch.square(avg_diff)
     return reward 
+
+
+def forward_hop_air_time(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    threshold_min: float = 0.12,
+    threshold_max: float = 0.25,
+    command_name: str = "twist",
+    command_threshold: float = 0.01,
+    vel_gate_ref: float = 0.1,
+) -> torch.Tensor:
+    """feet_air_time scaled by body progress in the COMMANDED direction.
+
+    The template ``feet_air_time`` only gates on the command magnitude, so a
+    vertical hop in place (zero forward progress) earns the full air-time reward
+    whenever any forward command is present — the "jump policy bounces / marches
+    in place instead of hopping forward" failure. track_linear_velocity's nudge
+    is too weak against that jackpot (air_time + leg_sync + upright already pay
+    ~13 mass without moving forward).
+
+    This multiplies the same air-time window by a 0→1 ramp of the body's actual
+    progress in the commanded direction (sign-aware, so a backward command
+    rewards backward hops too). Being airborne only pays proportionally to how
+    much the body is genuinely moving where it was told to go: a vertical hop or
+    a march in place earns ~0, a forward hop earns the full term. A zero command
+    is already zeroed by the command gate (``command_threshold``), so the
+    standing / "don't move" case is untouched.
+    """
+    from mjlab.tasks.velocity.mdp import feet_air_time as _template_air_time
+    reward = _template_air_time(
+        env,
+        sensor_name=sensor_name,
+        threshold_min=threshold_min,
+        threshold_max=threshold_max,
+        command_name=command_name,
+        command_threshold=command_threshold,
+    )
+    cmd_x = env.command_manager.get_command(command_name)[:, 0]
+    v_fwd = env.scene["robot"].data.root_link_lin_vel_b[:, 0]
+    progress = v_fwd * torch.sign(cmd_x)  # + when moving in the commanded direction
+    gate = (progress.clamp(min=0.0) / vel_gate_ref).clamp(max=1.0)
+    return reward * gate
+
+
+
+
+#dance
+@dataclass(kw_only=True)
+class SequencePoseCommandCfg(CommandTermCfg):
+    """Replays a predefined sequence of pose keyframes (a choreography) through a
+    command slot, so the policy tracks a fixed motion instead of a randomly
+    sampled pose.
+
+    ``keyframes`` is a tuple of ``(duration_s, pose)`` pairs. ``pose`` is a tuple
+    of N deltas; N is the command dim, inferred from the first keyframe (6 for the
+    ``body_pose`` slot ``[x, y, z, roll, pitch, yaw]``, 4 for ``head_pose``). The
+    reference advances continuously: each keyframe is held for ``duration_s``, and
+    during the last ``interp_s`` seconds it linearly blends into the next one
+    (constant-rate ramp). A *moving* reference is what lets the policy TRACK the
+    motion rather than camp at waypoints (AGENTS.md no-keyframe-trajectory lesson).
+
+    ``loop`` wraps the sequence end back to the start (default True).
+    ``random_phase_offset`` starts each env at a uniform random phase so a single
+    batch covers the whole sequence at every step (training diversity); set False
+    to always start at keyframe 0 (deployment semantics).
+    """
+    # The base CommandTerm resampling timer is ignored: this command advances its
+    # own phase clock every step (see SequencePoseCommand.compute). The default
+    # satisfies the required field without affecting behaviour.
+    resampling_time_range: tuple[float, float] = (1.0, 1.0)
+    keyframes: tuple[tuple[float, tuple[float, ...]], ...] = ()
+    interp_s: float = 0.1
+    loop: bool = True
+    random_phase_offset: bool = True
+
+    def build(self, env: ManagerBasedRlEnv) -> "SequencePoseCommand":
+        return SequencePoseCommand(self, env)
+
+
+class SequencePoseCommand(CommandTerm):
+    """Plays a fixed pose sequence (see SequencePoseCommandCfg).
+
+    The current reference pose is written to ``self._command`` (shape (N, dim))
+    every control step, so it flows into the ``generated_commands`` observation
+    and the matching tracking reward (e.g. ``body_pose_tracking_6d``) exactly like
+    a UniformPoseCommand — but deterministically, from the keyframe timeline.
+    """
+
+    cfg: "SequencePoseCommandCfg"
+
+    def __init__(self, cfg: "SequencePoseCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        if len(cfg.keyframes) < 1:
+            raise ValueError("SequencePoseCommandCfg.keyframes must be non-empty")
+        durs: list[float] = [k[0] for k in cfg.keyframes]
+        poses = [tuple(k[1]) for k in cfg.keyframes]
+        dim = len(poses[0])
+        if dim == 0:
+            raise ValueError("keyframe pose must be non-empty")
+        for p in poses:
+            if len(p) != dim:
+                raise ValueError("all keyframe poses must share the same dimension")
+
+        self._durs = torch.tensor(durs, dtype=torch.float32, device=self.device)
+        self._poses = torch.tensor(poses, dtype=torch.float32, device=self.device)  # (K, D)
+        # Start time of each keyframe within the loop.
+        self._starts = torch.cat(
+            (torch.zeros(1, device=self.device), torch.cumsum(self._durs, dim=0)[:-1])
+        )
+        self._total_dur = float(self._durs.sum())
+        self._command = torch.zeros(self.num_envs, dim, device=self.device)
+        self._phase_t = torch.zeros(self.num_envs, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._command
+
+    def _update_metrics(self) -> None:
+        pass
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        # Episode reset: restart the sequence, optionally at a random phase so
+        # the batch covers the whole motion from step 0.
+        n = len(env_ids)
+        if n == 0:
+            return
+        if self.cfg.random_phase_offset:
+            self._phase_t[env_ids] = torch.rand(n, device=self.device) * self._total_dur
+        else:
+            self._phase_t[env_ids] = 0.0
+        self._command[env_ids] = self._sample(self._phase_t[env_ids])
+
+    def _update_command(self) -> None:
+        self._command = self._sample(self._phase_t)
+
+    def compute(self, dt: float) -> None:
+        # Override the base timer: the sequence plays continuously, not on a
+        # resampling timer. Phase advances every control step; episode reset is
+        # handled by _resample_command above.
+        self._update_metrics()
+        self._phase_t += dt
+        self._update_command()
+
+    def _sample(self, t: torch.Tensor) -> torch.Tensor:
+        """Return the interpolated pose (N, D) at phase ``t`` (N,) seconds."""
+        K = self._poses.shape[0]
+        if self.cfg.loop:
+            t = torch.remainder(t, self._total_dur)
+        else:
+            t = t.clamp(max=self._total_dur - 1e-6)
+
+        idx = torch.searchsorted(self._starts, t, right=True) - 1  # (N,)
+        idx = idx.clamp(0, K - 1)
+        start = self._starts[idx]                                    # (N,)
+        dur = self._durs[idx].clamp(min=1e-6)                        # (N,)
+        u = (t - start) / dur                                        # [0, 1)
+        p_cur = self._poses[idx]                                     # (N, D)
+        p_next = self._poses[(idx + 1) % K]                          # (N, D)
+
+        # Blend into the next keyframe over the last `interp_s` seconds.
+        blend = (self.cfg.interp_s / dur).clamp(0.0, 0.5)            # (N,)
+        alpha = ((u - (1.0 - blend)) / blend.clamp(min=1e-6)).clamp(0.0, 1.0)
+        a = alpha.unsqueeze(-1)
+        return (1.0 - a) * p_cur + a * p_next
