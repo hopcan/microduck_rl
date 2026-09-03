@@ -281,11 +281,11 @@ def make_microduck_velocity_zombie_jump_env_cfg(
         "robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",)
     )
     cfg.rewards["pose"].params["walking_threshold"] = 0.01
-    cfg.rewards["pose"].weight = 1.0
+    cfg.rewards["pose"].weight = 0.2
 
     # Body-specific reward configurations
     cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
-    cfg.rewards["upright"].weight = 2.0
+    cfg.rewards["upright"].weight = 0.5
     cfg.rewards["upright"].params["std"] = math.sqrt(0.05)
     for reward_name in ["foot_clearance", "foot_slip"]:
         cfg.rewards[reward_name].params["asset_cfg"].site_names = site_names
@@ -304,7 +304,7 @@ def make_microduck_velocity_zombie_jump_env_cfg(
 
     cfg.rewards["leg_sync"] = RewardTermCfg(
         func=microduck_mdp.leg_sync_reward,
-        weight=1.0,
+        weight=5.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
@@ -312,17 +312,17 @@ def make_microduck_velocity_zombie_jump_env_cfg(
     # air_time window [0.125, 0.300] s. NOTE: standing still at zero command is
     # taught by the standing_envs curriculum (→25% standing envs by ~iter 2000),
     # not by an explicit stillness/no-stepping term.
-    cfg.rewards["air_time"].weight = 3.0
+    cfg.rewards["air_time"].weight = 8.0
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
-    cfg.rewards["air_time"].params["threshold_min"] = 0.100
-    cfg.rewards["air_time"].params["threshold_max"] = 0.300
+    cfg.rewards["air_time"].params["threshold_min"] = 0.05
+    cfg.rewards["air_time"].params["threshold_max"] = 0.25
 
     cfg.rewards["body_ang_vel"].weight = -0.05
-    cfg.rewards["angular_momentum"].weight = -0.02
+    cfg.rewards["angular_momentum"].weight = -0.1
 
     # Velocity tracking rewards
-    cfg.rewards["track_linear_velocity"].weight = 2.0
-    cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
+    cfg.rewards["track_linear_velocity"].weight = 3.0
+    cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.15)
     cfg.rewards["track_angular_velocity"].weight = 2.0
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
@@ -334,7 +334,7 @@ def make_microduck_velocity_zombie_jump_env_cfg(
     cfg.rewards["foot_clearance"].params["target_height"] = 0.02  # Increased from 0.01 to penalize dragging
 
     cfg.rewards["foot_swing_height"].params["command_threshold"] = 0.01
-    cfg.rewards["foot_swing_height"].params["target_height"] = 0.02  # Increased from 0.01 to force foot lifting
+    cfg.rewards["foot_swing_height"].params["target_height"] = 0.1  # Increased from 0.01 to force foot lifting
 
     # NOTE: no neck-only action-rate term — the shared action_rate_l2 sums over
     # ALL action dims (neck included), and head_pose_tracking below gives the
@@ -356,7 +356,7 @@ def make_microduck_velocity_zombie_jump_env_cfg(
     cfg.events["foot_friction"].params[
         "asset_cfg"
     ].geom_names = foot_frictions_geom_names
-    cfg.events["foot_friction"].params["ranges"] = (0.7, 1.3)  # Grippier footpad — narrowed from (0.3, 1.2)
+    cfg.events["foot_friction"].params["ranges"] = (1.2, 1.8)  # Grippier footpad — narrowed from (0.3, 1.2)
     # Terminate environments that have gone numerically unstable (NaN physics).
     # MuJoCo can produce NaN joint positions on extreme contact impulses.
     # Terminating immediately resets to a valid state before NaN propagates
@@ -627,9 +627,9 @@ def make_microduck_velocity_zombie_jump_env_cfg(
     # lin ±0.4 / ang ±2.0 outpaced the robot's capability and tracked a
     # post-iter-1000 reward/episode-length decline. ang ±1.0 is the big
     # change — it makes turning learnable.
-    command.ranges.lin_vel_x = (-0.4, 0.4)
-    command.ranges.lin_vel_y = (-0.3, 0.3)
-    command.ranges.ang_vel_z = (-1.0, 1.0)
+    command.ranges.lin_vel_x = (0.2, 0.6)
+    command.ranges.lin_vel_y = (-0.0, 0.0)
+    command.ranges.ang_vel_z = (-0.0, 0.0)
     command.viz.z_offset = 0.5
     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
     # Explicit turn-in-place bucket (see TURN_IN_PLACE_FRACTION above).

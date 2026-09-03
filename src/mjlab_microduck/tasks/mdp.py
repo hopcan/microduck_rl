@@ -7191,10 +7191,18 @@ def leg_sync_reward(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 )-> torch.Tensor:
-    left_hip = env.scene[asset_cfg.name].data.qpos  
-    print("env.scene[asset_cfg.name].data.qpos", env.scene[asset_cfg.name].data.qpos)
-    right_hip = env.scene[asset_cfg.name].data.qpos
-    
-    phase_diff = torch.abs(left_hip - right_hip)
-    reward = - torch.square(phase_diff) 
+    # print("env.scene[asset_cfg.name].data.qpos", env.scene[asset_cfg.name].data.joint_pos)]
+    # print(env.scene[asset_cfg.name].all_joint_names[3])
+    # print(env.scene[asset_cfg.name].all_joint_names[12])
+    # print(env.scene[asset_cfg.name].all_joint_names[4])
+    # print(env.scene[asset_cfg.name].all_joint_names[13])
+    left_pitch = env.scene[asset_cfg.name].data.joint_pos[:,3]
+    right_pitch = env.scene[asset_cfg.name].data.joint_pos[:,12]
+    left_knee = env.scene[asset_cfg.name].data.joint_pos[:,4]
+    right_knee = env.scene[asset_cfg.name].data.joint_pos[:,13]
+
+    front_diff = torch.abs(left_pitch - right_pitch)
+    rear_diff = torch.abs(left_knee - right_knee)
+    avg_diff = (front_diff + rear_diff) / 2.0
+    reward = - torch.square(avg_diff)
     return reward 
