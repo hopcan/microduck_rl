@@ -5367,6 +5367,101 @@ def body_pose_tracking_6d(
     return (r_x + r_y + r_z + r_r + r_p + r_w) / 6.0
 
 
+def _sample_pose_sequence(
+    t: torch.Tensor,
+    keyframes: tuple[tuple[float, tuple[float, ...]], ...],
+    interp_s: float,
+    loop: bool,
+) -> torch.Tensor:
+    """Linearly-interpolated pose (N, D) at phase ``t`` (N,) seconds from
+    ``keyframes`` — the same constant-rate blend rule as ``SequencePoseCommand``.
+
+    Each keyframe is held for its ``duration_s``; over the last ``interp_s``
+    seconds it blends into the next keyframe. ``loop`` wraps the end back to the
+    start. Pure function of ``t`` so a reward can replay a choreography from the
+    episode clock without needing a command slot (see ``foot_pose_tracking_6d``).
+    """
+    durs = [k[0] for k in keyframes]
+    poses = [tuple(k[1]) for k in keyframes]
+    K = len(poses)
+    if K == 0:
+        raise ValueError("keyframes must be non-empty")
+    D = len(poses[0])
+    durs_t = torch.tensor(durs, dtype=t.dtype, device=t.device)
+    poses_t = torch.tensor(poses, dtype=t.dtype, device=t.device)  # (K, D)
+    total = durs_t.sum()
+    starts = torch.cat(
+        (torch.zeros(1, dtype=t.dtype, device=t.device), torch.cumsum(durs_t, dim=0)[:-1])
+    )
+
+    if loop:
+        t = torch.remainder(t, total)
+    else:
+        t = t.clamp(max=total - 1e-6)
+
+    idx = torch.searchsorted(starts, t, right=True) - 1  # (N,)
+    idx = idx.clamp(0, K - 1)
+    start = starts[idx]
+    dur = durs_t[idx].clamp(min=1e-6)
+    u = (t - start) / dur
+    p_cur = poses_t[idx]
+    p_next = poses_t[(idx + 1) % K]
+    blend = (interp_s / dur).clamp(0.0, 0.5)
+    alpha = ((u - (1.0 - blend)) / blend.clamp(min=1e-6)).clamp(0.0, 1.0)
+    a = alpha.unsqueeze(-1)
+    return (1.0 - a) * p_cur + a * p_next
+
+
+def foot_pose_tracking_6d(
+    env: ManagerBasedRlEnv,
+    nominal: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    std: float = 0.02,
+    keyframes: tuple[tuple[float, tuple[float, ...]], ...] = (),
+    interp_s: float = 0.15,
+    loop: bool = True,
+    feet_cfg: SceneEntityCfg = SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Mean of 6 per-axis Gaussian rewards tracking a TIME-DRIVEN foot choreography.
+
+    Unlike ``body_pose_tracking_6d`` (which tracks a policy *command*), this
+    replays ``keyframes`` straight from the episode clock (``episode_length_buf``)
+    so the foot motion is authored in code and needs no command slot / obs term —
+    the policy sees it only through the reward. This is what keeps the dance env
+    at the shared 61D observation contract while still choreographing the feet.
+
+    The target is (N, 6) = [left_x, left_y, left_z, right_x, right_y, right_z],
+    each a DELTA (m) from ``nominal`` (the HOME foot placement) in the trunk body
+    frame; +z lifts that foot off the ground. Measuring in the trunk frame keeps
+    the target invariant to where the robot stands and which way it faces.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+
+    # Resolve the foot site names → indices if the manager hasn't already (the
+    # signature default is a bare SceneEntityCfg whose site_ids is still slice()).
+    if isinstance(feet_cfg.site_ids, slice):
+        feet_cfg.resolve(env.scene)
+
+    # Time-driven target: episode clock (steps) → seconds → phase within the loop.
+    t = env.episode_length_buf.float() * env.step_dt            # (N,) seconds since reset
+    cmd = _sample_pose_sequence(t, keyframes, interp_s, loop)   # (N, 6)
+
+    foot_w = asset.data.site_pos_w[:, feet_cfg.site_ids]  # (N, 2, 3)
+    root_pos_w = asset.data.root_link_pos_w               # (N, 3)
+    root_quat_w = asset.data.root_link_quat_w             # (N, 4)
+
+    # Foot offset from the trunk, rotated into the trunk body frame (Rᵀ·rel).
+    rel = torch.nan_to_num(foot_w - root_pos_w.unsqueeze(1), nan=0.0)  # (N, 2, 3)
+    R = matrix_from_quat(root_quat_w)                                  # (N, 3, 3)
+    body_frame = torch.bmm(rel, R.transpose(1, 2))                     # (N, 2, 3)
+    delta = body_frame.reshape(-1, 6)                                  # (N, 6)
+
+    nominal_t = torch.tensor(nominal, device=env.device, dtype=delta.dtype)
+    err = delta - nominal_t - cmd  # (N, 6)
+    per_axis = torch.exp(-(err / std) ** 2)
+    return per_axis.mean(dim=-1)  # (N,)
+
+
 def termination_param_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,

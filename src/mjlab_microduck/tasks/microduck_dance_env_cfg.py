@@ -24,16 +24,17 @@
   - 部署时把它设成 ``False`` 从关键帧 0 开始播放，或由运行时按同样的插值规则逐帧
     写 6D 参考位姿进 ``body_pose`` 槽。
 
-三个动作全部由 6D 身体位姿解析式表达（无需原来的 beat 相位）：
-  - 下蹲        —— 躯干 z 下降 2.5 cm
-  - 重心左右移  —— 躯干 roll ±8°
-  - 前倾        —— 躯干 pitch +6°
+动作全部由 6D 身体位姿解析式表达（无需原来的 beat 相位），一列 8 个关键帧在
+0.4s/拍 下连续播放，核心是「重拍下蹲、轻拍弹起」的弹跳律动（groove）：
+  - 弹跳律动     —— 躯干 z 重拍下蹲 4.5cm、轻拍弹回站高（律动主干）
+  - 重心左右移   —— 躯干 roll ±17° 左右摇摆（每侧占 2 拍）
+  - 前倾/后仰    —— 躯干 pitch +8.6°/-6.9° 前后点头（每方向占 2 拍）
 
 基于 ``make_microduck_velocity_env_cfg()`` 构建，所以 DR / 观测噪声 / 延迟 / NaN 加固 /
 BAM 摩擦等全部白拿；下面只重调或删除步行相关项：
   - twist(3) 保留速度语义但范围极小（本任务是原地舞，槽位保持存活）
-  - head_pose(4) 保持小范围（不扩宽 curriculum），head_pose_tracking 降权 —— 头部
-    只被轻轻拉向近中立命令，不抢身体序列的主导权
+  - head_pose(4) 同样换成序列命令（SequencePoseCommand），头部跟着同一 0.4s 拍子
+    点头/转头/侧倾，head_pose_tracking 权重提到 1.5（身体序列仍为主导）
   - 删掉步态项（air_time / foot_clearance / foot_swing_height）：双脚全程贴地，
     由 no_stepping 强制
   - 运动阻隔正则调低（舞蹈是动态任务）：body_ang_vel -0.05→-0.01、
@@ -69,16 +70,56 @@ ENABLE_SYMMETRY = False
 #   yaw    —— 躯干朝向（原地舞，恒为 0）
 # ─────────────────────────────────────────────────────────────────────────────
 DANCE_SEQUENCE = (
-    # (时长 s, (dx,  dy,  dz,     roll, pitch, yaw))
-    (1.0, (0.0, 0.0,  0.000,  0.00, 0.00, 0.0)),  # 中立站姿
-    (1.0, (0.0, 0.0, -0.025,  0.00, 0.00, 0.0)),  # 下蹲 2.5 cm
-    (1.0, (0.0, 0.0, 0.025,  0.14, 0.00, 0.0)),  # 下蹲 + 右倾 ~8°
-    (1.0, (0.0, 0.0, 0.025, -0.14, 0.00, 0.0)),  # 下蹲 + 左倾 ~8°
-    (1.0, (0.0, 0.0,  -0.000,  0.00, 0.10, 0.0)),  # 站起 + 前倾 ~6°
+    # (时长 s, (dx, dy, dz,      roll, pitch, yaw))  —— 0.4s/拍：重拍下蹲、轻拍弹起，
+    # 左右摇摆 / 前后点头各占 2 拍，8 拍循环 = 3.2s 的连续律动
+    (0.4, (0.0, 0.0, -0.045,  0.30,  0.00, 0.0)),   # 蹲 + 右倾 17°
+    (0.4, (0.0, 0.0,  0.000,  0.30,  0.00, 0.0)),   # 弹回站高 + 右倾
+    (0.4, (0.0, 0.0, -0.045, -0.30,  0.00, 0.0)),   # 蹲 + 左倾 17°
+    (0.4, (0.0, 0.0,  0.000, -0.30,  0.00, 0.0)),   # 弹回站高 + 左倾
+    (0.4, (0.0, 0.0, -0.045,  0.00,  0.15, 0.0)),   # 蹲 + 前倾 8.6°
+    (0.4, (0.0, 0.0,  0.000,  0.00,  0.15, 0.0)),   # 弹回站高 + 前倾
+    (0.4, (0.0, 0.0, -0.045,  0.00, -0.12, 0.0)),   # 蹲 + 后仰 6.9°
+    (0.4, (0.0, 0.0,  0.000,  0.00, -0.12, 0.0)),   # 弹回站高 + 后仰
 )
 
-# 相邻关键帧之间的匀速插值时间（秒）。参考位姿一直在动 → 策略学「跟踪」而非「蹲点」。
-DANCE_SEQ_INTERP_S = 0.3
+# 相邻关键帧之间的匀速插值时间（秒）。0.15s 让每拍先稳住重拍、再快速过渡到下一拍，
+# 打出清晰的律动点；参考位姿全程在动 → 策略学「跟踪」而非「蹲点」。
+DANCE_SEQ_INTERP_S = 0.15
+
+# 头部编舞（4D 增量，顺序 [neck_pitch, head_pitch, head_yaw, head_roll]，相对 HOME）。
+# 与 DANCE_SEQUENCE 同 8 拍 × 0.4s = 3.2s：部署时 random_phase_offset=False 两者都从
+# 关键帧 0 起播、同相位同步；训练时各自独立随机相位 → batch 覆盖所有相位组合，更鲁棒。
+# 方向约定（相对 HOME，需在 sim 里核对正负号）：neck/head_pitch 正 = 更前倾点头；
+# head_yaw 正 = 右转；head_roll 正 = 右倾。
+HEAD_SEQUENCE = (
+    # (时长 s, (neck_pitch, head_pitch, head_yaw, head_roll))
+    (0.4, ( 0.25,  0.25,  0.40,  0.15)),  # 点头 + 右转 + 右倾（随身体右倾）
+    (0.4, (-0.15, -0.15,  0.40,  0.15)),  # 抬头 + 右转 + 右倾
+    (0.4, ( 0.25,  0.25, -0.40, -0.15)),  # 点头 + 左转 + 左倾（随身体左倾）
+    (0.4, (-0.15, -0.15, -0.40, -0.15)),  # 抬头 + 左转 + 左倾
+    (0.4, ( 0.25,  0.25,  0.00,  0.00)),  # 点头（身体前倾）
+    (0.4, (-0.15, -0.15,  0.00,  0.00)),  # 抬头
+    (0.4, ( 0.25,  0.25,  0.00,  0.00)),  # 点头（身体后仰）
+    (0.4, (-0.15, -0.15,  0.00,  0.00)),  # 抬头
+)
+
+# 脚部编舞（6D 增量，顺序 [左x, 左y, 左z, 右x, 右y, 右z]，身体系，相对 HOME 脚位）。
+# z 正 = 抬脚（脚远离地面）；x/y 先保持 0（原地踏步，不做前后点步）。与 body/head 同
+# 8 拍 × 0.4s = 3.2s 同步。抬脚安排在「弹回站高」相位（身体近名义、耦合最小），且
+# 与侧倾同侧对应：右倾抬左脚、左倾抬右脚（承重脚在倾侧，对侧脚空出）。
+# nominal 是 HOME 下左右脚在身体系的实测位置（见 foot_pose_tracking_6d 的 nominal）。
+DANCE_FOOT_NOMINAL = (-0.0413, 0.0066, -0.11713, 0.0413, -0.00657, -0.11713)
+FOOT_SEQUENCE = (
+    # (时长 s, (Lx, Ly, Lz, Rx, Ry, Rz))
+    (0.4, (0.0, 0.0, 0.00, 0.0, 0.0, 0.00)),  # 双脚贴地（蹲 + 右倾）
+    (0.4, (0.0, 0.0, 0.04, 0.0, 0.0, 0.00)),  # 抬左脚 4cm（弹回 + 右倾）
+    (0.4, (0.0, 0.0, 0.00, 0.0, 0.0, 0.00)),  # 双脚贴地（蹲 + 左倾）
+    (0.4, (0.0, 0.0, 0.00, 0.0, 0.0, 0.04)),  # 抬右脚 4cm（弹回 + 左倾）
+    (0.4, (0.0, 0.0, 0.00, 0.0, 0.0, 0.00)),  # 双脚贴地（蹲 + 前倾）
+    (0.4, (0.0, 0.0, 0.04, 0.0, 0.0, 0.00)),  # 抬左脚 4cm（弹回 + 前倾）
+    (0.4, (0.0, 0.0, 0.00, 0.0, 0.0, 0.00)),  # 双脚贴地（蹲 + 后仰）
+    (0.4, (0.0, 0.0, 0.00, 0.0, 0.0, 0.04)),  # 抬右脚 4cm（弹回 + 后仰）
+)
 
 # 本任务不驱动的槽位的保活采样范围（死权重守卫：命令槽从第 0 步就非零，输入神经元不僵死）。
 TWIST_TINY_LIN = 0.02   # m/s
@@ -111,9 +152,15 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     twist.ranges.lin_vel_y = (-TWIST_TINY_LIN, TWIST_TINY_LIN)
     twist.ranges.ang_vel_z = (-TWIST_TINY_ANG, TWIST_TINY_ANG)
 
-    # head_pose：保留基础工厂的小范围；下方删除扩宽 curriculum。头部参考（近中立）
-    # 由 head_pose_tracking 轻量追踪，不再有单独的 head_bob 关节参考。
-    # （cfg.commands["head_pose"] 不动。）
+    # head_pose：头部也走预定义序列（4D 增量，顺序 [neck_pitch, head_pitch, head_yaw,
+    # head_roll]），与身体同一 0.4s 拍同步点头/转头/侧倾。SequencePoseCommand 从首个
+    # 关键帧推断维度=4，直接喂进 head_pose_tracking。
+    cfg.commands["head_pose"] = microduck_mdp.SequencePoseCommandCfg(
+        keyframes=HEAD_SEQUENCE,
+        interp_s=DANCE_SEQ_INTERP_S,
+        loop=True,
+        random_phase_offset=True,
+    )
 
     # body_pose：动作序列命令 —— 把 6D 槽从「随机采样」换成「按时间轴播放预定义序列」。
     cfg.commands["body_pose"] = microduck_mdp.SequencePoseCommandCfg(
@@ -122,6 +169,9 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         loop=True,               # 序列播完回到开头循环
         random_phase_offset=True,  # 训练多样性：每个 env 随机相位起播，batch 覆盖整段序列
     )
+
+    # 脚不占命令槽 / obs：脚部编舞由 foot_pose_tracking_6d 直接按 episode 时钟播放
+    # FOOT_SEQUENCE（时间驱动，策略只通过奖励感知），观测保持 61D 契约不变。
 
     # === 奖励 ===
     # 步态项关闭 —— 三个动作双脚都贴地。
@@ -146,8 +196,10 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["pose"].params["std_walking"] = DANCE_STD_POSE
     cfg.rewards["pose"].params["std_running"] = DANCE_STD_POSE
 
-    # 头部位姿槽：保持存活、近中立；权重压低，不抢身体序列主导权。
-    cfg.rewards["head_pose_tracking"].weight = 0.1
+    # 头部走序列：把 head_pose_tracking 从「近中立存活」提到次主目标（身体 2.5 仍是
+    # 主导）。std=0.3 让头部真正够到点头/转头目标（基础 0.5 太松，头会随重力下垂）。
+    cfg.rewards["head_pose_tracking"].weight = 1.5
+    cfg.rewards["head_pose_tracking"].params["std"] = 0.3
 
     # 主目标：追踪动作序列。基础工厂已注册 body_pose_tracking（body_pose_tracking_6d，
     # 权重 0 禁用），这里把权重提上来、并把 nominal_height 换成实测站高、收紧 z/角度
@@ -158,11 +210,19 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["body_pose_tracking"].params["angle_std"] = math.radians(6)
     # xy_std 保持基础的 0.05（dx=dy=0，原地舞，容差宽松）。
 
-    # 双脚贴地（自否成本 ≥ 0 → 负权重）。
-    cfg.rewards["no_stepping"] = RewardTermCfg(
-        func=microduck_mdp.no_stepping_penalty,
-        weight=-0.5,
-        params={"sensor_name": "feet_ground_contact"},
+    # 脚部编舞：时间驱动追踪 6D 身体系脚位增量（body 2.5 主导、head 1.5、脚 1.5 次主）。
+    # keyframes=FOOT_SEQUENCE 让奖励按 episode 时钟播放编舞（不占命令槽/obs）；nominal 用
+    # HOME 下左右脚实测位置；std=2cm 是抬脚 4cm 的一半 —— 抬半脚仍有一半奖励、抬满满分。
+    cfg.rewards["foot_pose_tracking"] = RewardTermCfg(
+        func=microduck_mdp.foot_pose_tracking_6d,
+        weight=1.5,
+        params={
+            "nominal": DANCE_FOOT_NOMINAL,
+            "std": 0.02,
+            "keyframes": FOOT_SEQUENCE,
+            "interp_s": DANCE_SEQ_INTERP_S,
+            "loop": True,
+        },
     )
 
     # === Curriculum ===
